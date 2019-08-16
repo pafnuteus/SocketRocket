@@ -24,5 +24,6 @@
                    readToCurrentFrame:(BOOL)readToCurrentFrame
                           unmaskBytes:(BOOL)unmaskBytes;
 - (void)returnConsumer:(SRIOConsumer *)consumer;
+- (void)clear;
 
 @end

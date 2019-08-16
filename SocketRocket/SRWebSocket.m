@@ -270,6 +270,14 @@ NSString *const SRHTTPResponseErrorKey = @"HTTPResponseStatusCode";
     SRMutexDestroy(_kvoLock);
 }
 
+-(void)_onTimeout
+{
+    if (self.readyState == SR_CONNECTING) {
+        NSError *error = SRErrorWithDomainCodeDescription(NSURLErrorDomain, NSURLErrorTimedOut, @"Timed out connecting to server.");
+        [self _failWithError:error];
+    }
+}
+
 ///--------------------------------------
 #pragma mark - Accessors
 ///--------------------------------------
@@ -318,13 +326,15 @@ NSString *const SRHTTPResponseErrorKey = @"HTTPResponseStatusCode";
     _selfRetain = self;
 
     if (_urlRequest.timeoutInterval > 0) {
-        dispatch_time_t popTime = dispatch_time(DISPATCH_TIME_NOW, (int64_t)(_urlRequest.timeoutInterval * NSEC_PER_SEC));
-        dispatch_after(popTime, dispatch_get_main_queue(), ^{
-            if (self.readyState == SR_CONNECTING) {
-                NSError *error = SRErrorWithDomainCodeDescription(NSURLErrorDomain, NSURLErrorTimedOut, @"Timed out connecting to server.");
-                [self _failWithError:error];
-            }
-        });
+//        dispatch_time_t popTime = dispatch_time(DISPATCH_TIME_NOW, (int64_t)(_urlRequest.timeoutInterval * NSEC_PER_SEC));
+//        dispatch_after(popTime, _workQueue, ^{
+////        dispatch_after(popTime, dispatch_get_main_queue(), ^{
+//            if (self.readyState == SR_CONNECTING) {
+//                NSError *error = SRErrorWithDomainCodeDescription(NSURLErrorDomain, NSURLErrorTimedOut, @"Timed out connecting to server.");
+//                [self _failWithError:error];
+//            }
+//        });
+        [self performSelector:@selector(_onTimeout) withObject:nil afterDelay:_urlRequest.timeoutInterval];
     }
 
     _proxyConnect = [[SRProxyConnect alloc] initWithURL:_url];
@@ -430,14 +440,25 @@ NSString *const SRHTTPResponseErrorKey = @"HTTPResponseStatusCode";
         _receivedHTTPHeaders = CFHTTPMessageCreateEmpty(NULL, NO);
     }
 
+    __weak typeof(self) wself = self;
     [self _readUntilHeaderCompleteWithCallback:^(SRWebSocket *socket,  NSData *data) {
-        CFHTTPMessageAppendBytes(_receivedHTTPHeaders, (const UInt8 *)data.bytes, data.length);
-
-        if (CFHTTPMessageIsHeaderComplete(_receivedHTTPHeaders)) {
-            SRDebugLog(@"Finished reading headers %@", CFBridgingRelease(CFHTTPMessageCopyAllHeaderFields(_receivedHTTPHeaders)));
-            [self _HTTPHeadersDidFinish];
+//        CFHTTPMessageAppendBytes(_receivedHTTPHeaders, (const UInt8 *)data.bytes, data.length);
+//
+//        if (CFHTTPMessageIsHeaderComplete(_receivedHTTPHeaders)) {
+//            SRDebugLog(@"Finished reading headers %@", CFBridgingRelease(CFHTTPMessageCopyAllHeaderFields(_receivedHTTPHeaders)));
+//            [self _HTTPHeadersDidFinish];
+        __strong typeof(wself) sself = wself;
+        if (sself == nil)
+            return;
+        
+        CFHTTPMessageAppendBytes(sself.receivedHTTPHeaders, (const UInt8 *)data.bytes, data.length);
+        
+        if (CFHTTPMessageIsHeaderComplete(sself.receivedHTTPHeaders)) {
+            SRDebugLog(@"Finished reading headers %@", CFBridgingRelease(CFHTTPMessageCopyAllHeaderFields(sself.receivedHTTPHeaders)));
+            [sself _HTTPHeadersDidFinish];
         } else {
-            [self _readHTTPHeader];
+//            [self _readHTTPHeader];
+            [sself _readHTTPHeader];
         }
     }];
 }
@@ -561,13 +582,12 @@ NSString *const SRHTTPResponseErrorKey = @"HTTPResponseStatusCode";
     dispatch_async(_workQueue, ^{
         if (self.readyState != SR_CLOSED) {
             _failed = YES;
+            self.readyState = SR_CLOSED;
             [self.delegateController performDelegateBlock:^(id<SRWebSocketDelegate>  _Nullable delegate, SRDelegateAvailableMethods availableMethods) {
                 if (availableMethods.didFailWithError) {
                     [delegate webSocket:self didFailWithError:error];
                 }
             }];
-
-            self.readyState = SR_CLOSED;
 
             SRDebugLog(@"Failing with error %@", error.localizedDescription);
 
@@ -1015,7 +1035,8 @@ static const uint8_t SRPayloadLenMask   = 0x7F;
                 }
 
                 if (header.masked) {
-                    assert(mapped_size >= sizeof(_currentReadMaskOffset) + offset);
+//                    assert(mapped_size >= sizeof(_currentReadMaskOffset) + offset);
+                    assert(mapped_size >= sizeof(_currentReadMaskKey) + offset);
                     memcpy(eself->_currentReadMaskKey, ((uint8_t *)mapped_buffer) + offset, sizeof(eself->_currentReadMaskKey));
                 }
 
@@ -1084,15 +1105,16 @@ static const uint8_t SRPayloadLenMask   = 0x7F;
         !_sentClose) {
         _sentClose = YES;
 
-        @synchronized(self) {
-            [_outputStream close];
-            [_inputStream close];
-
-
-            for (NSArray *runLoop in [_scheduledRunloops copy]) {
-                [self unscheduleFromRunLoop:[runLoop objectAtIndex:0] forMode:[runLoop objectAtIndex:1]];
-            }
-        }
+//        @synchronized(self) {
+//            [_outputStream close];
+//            [_inputStream close];
+//
+//
+//            for (NSArray *runLoop in [_scheduledRunloops copy]) {
+//                [self unscheduleFromRunLoop:[runLoop objectAtIndex:0] forMode:[runLoop objectAtIndex:1]];
+//            }
+//        }
+        [self _scheduleCleanup];
 
         if (!_failed) {
             [self.delegateController performDelegateBlock:^(id<SRWebSocketDelegate>  _Nullable delegate, SRDelegateAvailableMethods availableMethods) {
@@ -1137,26 +1159,61 @@ static const uint8_t SRPayloadLenMask   = 0x7F;
         }
 
         _cleanupScheduled = YES;
-
+        // _consumers retain SRWebSocket instance by block copy, if there are consumers here, clear them.
+        [_consumers removeAllObjects];
+        [_consumerPool clear];
+        
+        // Cancel the timer which retains SRWebSocket instance.
+        // If we don't cancel the timer, the 'dealloc' method will be invoked only after the time (default: 60s) have come, which may cause memory increase.
+        dispatch_async(dispatch_get_main_queue(), ^(){
+            [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(_onTimeout) object:nil];
+        });
+    }
+    
+    // Cleanup NSStream delegate's in the same RunLoop used by the streams themselves:
+    // This way we'll prevent race conditions between handleEvent and SRWebsocket's dealloc
+    NSTimer *timer = [NSTimer timerWithTimeInterval:(0.0f) target:self selector:@selector(_cleanupSelfReference:) userInfo:nil repeats:NO];
+    [[NSRunLoop SR_networkRunLoop] addTimer:timer forMode:NSDefaultRunLoopMode];
+}
         // Cleanup NSStream delegate's in the same RunLoop used by the streams themselves:
-        // This way we'll prevent race conditions between handleEvent and SRWebsocket's dealloc
-        NSTimer *timer = [NSTimer timerWithTimeInterval:(0.0f) target:self selector:@selector(_cleanupSelfReference:) userInfo:nil repeats:NO];
-        [[NSRunLoop SR_networkRunLoop] addTimer:timer forMode:NSDefaultRunLoopMode];
+//        // This way we'll prevent race conditions between handleEvent and SRWebsocket's dealloc
+//        NSTimer *timer = [NSTimer timerWithTimeInterval:(0.0f) target:self selector:@selector(_cleanupSelfReference:) userInfo:nil repeats:NO];
+//        [[NSRunLoop SR_networkRunLoop] addTimer:timer forMode:NSDefaultRunLoopMode];
+//    }
+//}
+
+- (void)removeAllFromRunLoops {
+    for (NSArray *runLoop in [_scheduledRunloops copy]) {
+        [self unscheduleFromRunLoop:[runLoop objectAtIndex:0] forMode:[runLoop objectAtIndex:1]];
     }
 }
 
 - (void)_cleanupSelfReference:(NSTimer *)timer
 {
     @synchronized(self) {
-        // Nuke NSStream delegate's
-        _inputStream.delegate = nil;
-        _outputStream.delegate = nil;
 
         // Remove the streams, right now, from the networkRunLoop
         [_inputStream close];
         [_outputStream close];
-    }
 
+        // Nuke NSStream delegate's
+        _inputStream.delegate = nil;
+        _outputStream.delegate = nil;
+    }
+    [_inputStream close];
+    [_outputStream close];
+    
+    [self removeAllFromRunLoops];
+    
+    _inputStream.delegate = nil;
+    _outputStream.delegate = nil;
+    
+    //this is done to make sure that last request in the loop, is for setting _selfRetain to nil
+    NSTimer *selfRefTimer = [NSTimer timerWithTimeInterval:(0.0f) target:self selector:@selector(releaseSelfRef) userInfo:nil repeats:NO];
+    [[NSRunLoop SR_networkRunLoop] addTimer:selfRefTimer forMode:NSDefaultRunLoopMode];
+}
+
+- (void)releaseSelfRef {
     // Cleanup selfRetain in the same GCD queue as usual
     dispatch_async(_workQueue, ^{
         _selfRetain = nil;
