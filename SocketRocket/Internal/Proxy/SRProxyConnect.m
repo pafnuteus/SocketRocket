@@ -286,8 +286,8 @@
 
     [self.inputStream scheduleInRunLoop:[NSRunLoop SR_networkRunLoop]
                                 forMode:NSDefaultRunLoopMode];
-    //[self.outputStream scheduleInRunLoop:[NSRunLoop SR_networkRunLoop]
-    //                           forMode:NSDefaultRunLoopMode];
+    [self.outputStream scheduleInRunLoop:[NSRunLoop SR_networkRunLoop]
+                               forMode:NSDefaultRunLoopMode];
     [self.outputStream open];
     [self.inputStream open];
 }
